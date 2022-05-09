@@ -111,7 +111,7 @@ func FLBPluginInit(ctx unsafe.Pointer) int {
 		}
 		batchSize = size
 	} else {
-		klog.Infof("you set the default bacth_size: %d", DefaultBatchSize)
+		klog.Infof("you set the default batch_size: %d", DefaultBatchSize)
 		batchSize = DefaultBatchSize
 	}
 
@@ -155,7 +155,7 @@ func FLBPluginInit(ctx unsafe.Pointer) int {
 }
 
 //export FLBPluginFlush
-// FLBPluginFlush is called from fluent-bit when data need to be sent. is called from fluent-bit when data need to be sent.
+// FLBPluginFlush is called from fluent-bit when data need to be sent.
 func FLBPluginFlush(data unsafe.Pointer, length C.int, tag *C.char) int {
 	rw.Lock()
 	defer rw.Unlock()
@@ -241,44 +241,44 @@ func FLBPluginFlush(data unsafe.Pointer, length C.int, tag *C.char) int {
 			}
 
 			switch k {
-			case "cluster":
-				log.Cluster = value
-			case "kubernetes_namespace_name":
-				log.Namespace = value
-			case "kubernetes_labels_app":
-				log.App = value
-			case "kubernetes_labels_k8s-app":
-				log.App = value
-			case "kubernetes_pod_name":
-				log.Pod = value
-			case "kubernetes_container_name":
-				log.Container = value
-			case "kubernetes_host":
-				log.Host = value
-			case "log":
-				log.Log = value
+				case "cluster":
+					log.Cluster = value
+				case "kubernetes_namespace_name":
+					log.Namespace = value
+				case "kubernetes_labels_app":
+					log.App = value
+				case "kubernetes_labels_k8s-app":
+					log.App = value
+				case "kubernetes_pod_name":
+					log.Pod = value
+				case "kubernetes_container_name":
+					log.Container = value
+				case "kubernetes_host":
+					log.Host = value
+				case "log":
+					log.Log = value
 			}
-
 		}
 
 		if log.App == "" {
 			break
 		}
 
-		//log.Ts = time.Unix(int64(timestamp), 0)
+		//log.Ts = time.Unix(timestamp.Unix(), 0)
 		log.Ts = timestamp
 		buffer = append(buffer, log)
 	}
 
 	// sink data
 	if len(buffer) < batchSize {
+		klog.Infof("Buffer size is not enough for flushing: %d < %d", len(buffer), batchSize)
 		return output.FLB_OK
 	}
 
 
 	sql := fmt.Sprintf(insertSQL, database, table)
 
-	//start := time.Now()
+	start := time.Now()
 	// post them to db all at once
 	tx, err := client.Begin()
 	if err != nil {
@@ -310,8 +310,8 @@ func FLBPluginFlush(data unsafe.Pointer, length C.int, tag *C.char) int {
 		return output.FLB_ERROR
 	}
 
-	//end := time.Now()
-	//klog.Infof("Exported %d log to clickhouse in %s", len(buffer), end.Sub(start))
+	end := time.Now()
+	klog.Infof("Exported %d log to clickhouse in %s", len(buffer), end.Sub(start))
 
 	buffer = make([]Log, 0)
 
@@ -321,6 +321,7 @@ func FLBPluginFlush(data unsafe.Pointer, length C.int, tag *C.char) int {
 
 //export FLBPluginExit
 func FLBPluginExit() int {
+	klog.Infof("Buffer contains %d entries before exir", len(buffer))
 	return output.FLB_OK
 }
 

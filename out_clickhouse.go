@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"sync"
 
@@ -14,7 +15,7 @@ import (
 
 	"github.com/fluent/fluent-bit-go/output"
 	//"github.com/ugorji/go/codec"
-    "github.com/kshvakov/clickhouse"
+	"github.com/kshvakov/clickhouse"
 	klog "k8s.io/klog"
 )
 
@@ -25,9 +26,9 @@ var (
 	table     string
 	batchSize int
 
-	insertSQL = "INSERT INTO %s.%s(date, cluster, namespace, app, pod_name, container_name, host, log, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+	insertSQL = "INSERT INTO %s.%s(date, cluster, namespace, app, pod_name, container_name, host, log, ts, rid, method, time, path, code) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 
-	rw sync.RWMutex
+	rw     sync.RWMutex
 	buffer = make([]Log, 0)
 )
 
@@ -39,14 +40,19 @@ const (
 )
 
 type Log struct {
-	Cluster       string
-	Namespace     string
-	App           string
+	Cluster   string
+	Namespace string
+	App       string
 	Pod       string
 	Container string
-	Host          string
-	Log           string
-	Ts            time.Time
+	Host      string
+	Log       string
+	Ts        time.Time
+	Rid       string
+	Method    string
+	Time      string
+	Path      string
+	Code      string
 }
 
 //export FLBPluginRegister
@@ -104,7 +110,7 @@ func FLBPluginInit(ctx unsafe.Pointer) int {
 	}
 
 	if v := os.Getenv("CLICKHOUSE_BATCH_SIZE"); v != "" {
-		size ,err:=strconv.Atoi(v)
+		size, err := strconv.Atoi(v)
 		if err != nil {
 			klog.Infof("you set the default bacth_size: %d", DefaultBatchSize)
 			batchSize = DefaultBatchSize
@@ -147,9 +153,8 @@ func FLBPluginInit(ctx unsafe.Pointer) int {
 		}
 		return output.FLB_ERROR
 	}
-    // ==
+	// ==
 	client = db
-
 
 	return output.FLB_OK
 }
@@ -159,7 +164,6 @@ func FLBPluginInit(ctx unsafe.Pointer) int {
 func FLBPluginFlush(data unsafe.Pointer, length C.int, tag *C.char) int {
 	rw.Lock()
 	defer rw.Unlock()
-
 
 	// ping
 	if err := client.Ping(); err != nil {
@@ -171,23 +175,90 @@ func FLBPluginFlush(data unsafe.Pointer, length C.int, tag *C.char) int {
 		return output.FLB_ERROR
 	}
 
-	// prepare data
-	//var h codec.Handle = new(codec.MsgpackHandle)
-
-	//var b []byte
-	//var m interface{}
-	//var err error
-
-	//b = C.GoBytes(data, length)
-	//dec := codec.NewDecoderBytes(b, h)
-
-	var ret int
-	var timestampData interface{}
-	var mapData map[interface{}]interface{}
-
 	// Create Fluent Bit decoder
 	dec := output.NewDecoder(data, int(length))
 
+	fillBuffer(dec)
+
+	// sink data
+	if len(buffer) < batchSize {
+		klog.Infof("Buffer size is not enough for flushing: %d < %d", len(buffer), batchSize)
+		return output.FLB_OK
+	}
+
+	result := flushToDatabase()
+	return result
+}
+
+//export FLBPluginExit
+func FLBPluginExit() int {
+	klog.Infof("Buffer contains %d entries before exit", len(buffer))
+	rw.Lock()
+	defer rw.Unlock()
+	if len(buffer) == 0 {
+		return output.FLB_OK
+	}
+
+	// ping
+	if err := client.Ping(); err != nil {
+		if exception, ok := err.(*clickhouse.Exception); ok {
+			klog.Errorf("[%d] %s \n%s\n", exception.Code, exception.Message, exception.StackTrace)
+		} else {
+			klog.Errorf("Failed to ping clickhouse: %v", err)
+		}
+		return output.FLB_ERROR
+	}
+
+	result := flushToDatabase()
+	return result
+}
+
+func flushToDatabase() int {
+	sql := fmt.Sprintf(insertSQL, database, table)
+
+	start := time.Now()
+	// post them to db all at once
+	tx, err := client.Begin()
+	if err != nil {
+		klog.Errorf("begin transaction failure: %s", err.Error())
+		return output.FLB_ERROR
+	}
+
+	// build statements
+	smt, err := tx.Prepare(sql)
+	if err != nil {
+		klog.Errorf("prepare statement failure: %s", err.Error())
+		return output.FLB_ERROR
+	}
+	for _, l := range buffer {
+		// ensure tags are inserted in the same order each time
+		// possibly/probably impacts indexing?
+		_, err = smt.Exec(l.Ts, l.Cluster, l.Namespace, l.App, l.Pod, l.Container, l.Host,
+			l.Log, l.Ts, l.Rid, l.Method, l.Time, l.Path, l.Code)
+
+		if err != nil {
+			klog.Errorf("statement exec failure: %s", err.Error())
+			return output.FLB_ERROR
+		}
+	}
+
+	// commit and record metrics
+	if err = tx.Commit(); err != nil {
+		klog.Errorf("commit failed failure: %s", err.Error())
+		return output.FLB_ERROR
+	}
+
+	end := time.Now()
+	klog.Infof("Exported %d log to clickhouse in %s", len(buffer), end.Sub(start))
+
+	buffer = make([]Log, 0)
+	return output.FLB_OK
+}
+
+func fillBuffer(decoder *output.FLBDecoder) {
+	var ret int
+	var timestampData interface{}
+	var mapData map[interface{}]interface{}
 	for {
 		//// decode the msgpack data
 		//err = dec.Decode(&m)
@@ -195,7 +266,7 @@ func FLBPluginFlush(data unsafe.Pointer, length C.int, tag *C.char) int {
 		//	break
 		//}
 
-		ret, timestampData, mapData = output.GetRecord(dec)
+		ret, timestampData, mapData = output.GetRecord(decoder)
 		if ret != 0 {
 			break
 		}
@@ -241,22 +312,78 @@ func FLBPluginFlush(data unsafe.Pointer, length C.int, tag *C.char) int {
 			}
 
 			switch k {
-				case "cluster":
-					log.Cluster = value
-				case "kubernetes_namespace_name":
-					log.Namespace = value
-				case "kubernetes_labels_app":
-					log.App = value
-				case "kubernetes_labels_k8s-app":
-					log.App = value
-				case "kubernetes_pod_name":
-					log.Pod = value
-				case "kubernetes_container_name":
-					log.Container = value
-				case "kubernetes_host":
-					log.Host = value
-				case "log":
+			case "cluster":
+				log.Cluster = value
+			case "kubernetes_namespace_name":
+				log.Namespace = value
+			case "kubernetes_labels_app":
+				log.App = value
+			case "kubernetes_labels_k8s-app":
+				log.App = value
+			case "kubernetes_pod_name":
+				log.Pod = value
+			case "kubernetes_container_name":
+				log.Container = value
+			case "kubernetes_host":
+				log.Host = value
+			case "log":
+				ok, envoy_keys := parseEnvoy(value)
+				if !ok {
 					log.Log = value
+				} else {
+					for k_, v_ := range envoy_keys {
+						switch k_ {
+						case "time":
+							log.Time = v_
+						case "method":
+							log.Method = v_
+						case "path":
+							log.Path = v_
+						case "code":
+							log.Code = v_
+						case "x_request_id":
+							log.Rid = v_
+						}
+					}
+				}
+
+				//case "response_flags":
+				//	log.* = value
+				//case "response_code_details":
+				//	log.* = value
+				//case "connection_termination_details":
+				//	log.* = value
+				//case "upstream_transport_failure_reason":
+				//	log.* = value
+				//case "bytes_received":
+				//	log.* = value
+				//case "bytes_sent":
+				//	log.* = value
+				//case "duration":
+				//	log.* = value
+				//case "x-envoy-upstream-service-time":
+				//	log.* = value
+				//case "x-forwarded-for":
+				//	log.* = value
+				//case "user-agent":
+				//	log.* = value
+
+				//case "authority":
+				//	log.* = value
+				//case "upstream_host":
+				//	log.* = value
+				//case "upstream_cluster":
+				//	log.* = value
+				//case "upstream_local_address":
+				//	log.* = value
+				//case "downstream_local_address":
+				//	log.* = value
+				//case "downstream_remote_address":
+				//	log.* = value
+				//case "requested_server_name":
+				//	log.* = value
+				//case "route_name":
+				//	log.* = value
 			}
 		}
 
@@ -268,64 +395,24 @@ func FLBPluginFlush(data unsafe.Pointer, length C.int, tag *C.char) int {
 		log.Ts = timestamp
 		buffer = append(buffer, log)
 	}
-
-	// sink data
-	if len(buffer) < batchSize {
-		klog.Infof("Buffer size is not enough for flushing: %d < %d", len(buffer), batchSize)
-		return output.FLB_OK
-	}
-
-
-	sql := fmt.Sprintf(insertSQL, database, table)
-
-	start := time.Now()
-	// post them to db all at once
-	tx, err := client.Begin()
-	if err != nil {
-		klog.Errorf("begin transaction failure: %s", err.Error())
-		return output.FLB_ERROR
-	}
-
-	// build statements
-	smt, err := tx.Prepare(sql)
-	if err != nil {
-		klog.Errorf("prepare statement failure: %s", err.Error())
-		return output.FLB_ERROR
-	}
-	for _, l := range buffer {
-		// ensure tags are inserted in the same order each time
-		// possibly/probably impacts indexing?
-		_, err = smt.Exec(l.Ts, l.Cluster, l.Namespace, l.App, l.Pod, l.Container, l.Host,
-			l.Log, l.Ts)
-
-		if err != nil {
-			klog.Errorf("statement exec failure: %s", err.Error())
-			return output.FLB_ERROR
-		}
-	}
-
-	// commit and record metrics
-	if err = tx.Commit(); err != nil {
-		klog.Errorf("commit failed failure: %s", err.Error())
-		return output.FLB_ERROR
-	}
-
-	end := time.Now()
-	klog.Infof("Exported %d log to clickhouse in %s", len(buffer), end.Sub(start))
-
-	buffer = make([]Log, 0)
-
-	return output.FLB_OK
 }
 
-
-//export FLBPluginExit
-func FLBPluginExit() int {
-	klog.Infof("Buffer contains %d entries before exir", len(buffer))
-	return output.FLB_OK
+func parseEnvoy(value string) (bool, map[string]string) {
+	r := regexp.MustCompile(`\[(?P<time>[^\]]*)\] "(?P<method>\S+)(?: +(?P<path>[^\"]*?)(?: +\S*)?)(?: +?P<protocol>\S+)?" (?P<code>[^ ]*) (?P<response_flags>[^ ]*) (?P<response_code_details>[^ ]*) (?P<connection_termination_details>[^ ]*) "(?P<upstream_transport_failure_reason>[^ ]*)" (?P<bytes_received>[^ ]*) (?P<bytes_sent>[^ ]*) (?P<duration>[^ ]*) (?P<x_envoy_upstream_service_time>[^ ]*) "(?P<x_forwarded_for>[^ ]*)" "(?P<user_agent>[^\"]*)" "(?P<x_request_id>[^ ]*)" "(?P<authority>[^ ]*)" "(?P<upstream_host>[^ ]*)" (?P<upstream_cluster>[^ ]*) (?P<upstream_local_address>[^ ]*) (?P<downstream_local_address>[^ ]*) (?P<downstream_remote_address>[^ ]*) (?P<requested_server_name>[^ ]*) (?P<route_name>[^ ]*)`)
+	matches := r.FindStringSubmatch(value)
+	names := r.SubexpNames()
+	for i, name := range r.SubexpNames() {
+		fmt.Printf("%v: %v\n", name, matches[i])
+	}
+	if len(matches) != len(names) {
+		return false, nil
+	}
+	result := make(map[string]string)
+	for i, name := range names {
+		result[name] = matches[i]
+	}
+	return true, result
 }
 
 func main() {
 }
-
-

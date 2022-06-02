@@ -136,15 +136,13 @@ spec:
             requests:
               cpu: 200m
               memory: 200Mi
+          envFrom:
+            - secretRef:
+                name: clickhouse-logs-credentials
+
           env:
             - name: CLUSTER_NAME
               value: "xxx-cce-prod"
-            - name: CLICKHOUSE_HOST
-              value: "51.250.71.234:9000"
-            - name: CLICKHOUSE_USER
-              value: "default"
-            - name: CLICKHOUSE_PASSWORD
-              value: "password"
             - name: CLICKHOUSE_DATABASE
               value: "scmp"
             - name: CLICKHOUSE_TABLE

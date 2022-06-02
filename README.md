@@ -1,8 +1,32 @@
 # fluent-bit-clickhouse
-Fluent-Bit go clickhouse output plugin, for istio with love
+Fluent-Bit go clickhouse output plugin, for Istio with love
 
 
-Fixed parser for envoy logs
+Added custom parser for envoy logs. It extracts following fields:
+- time
+- method
+- path
+- code
+- x_request_id
+
+Credentials are moved to secret file, previously it was in pure envs. You should create secret with name {}. Example:
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: clickhouse-logs-credentials
+type: Opaque
+data:
+  CLICKHOUSE_USER: some_user
+  CLICKHOUSE_PASSWORD: some_password
+  CLICKHOUSE_HOST: localhost:9000
+```
+
+
+We could've implemented it just with config file, but the initial format of log is json and it will be passed to 
+json parser without additional processing.  
+
+In better world we could write like this, for example:
 ```
 [PARSER]
   Name envoy
